@@ -1,0 +1,2012 @@
+import threading
+import os
+import asyncio
+import aiohttp
+import discord
+from discord import app_commands
+from discord.ext import tasks
+from flask import Flask, request, redirect
+from database import db
+from datetime import datetime, timedelta
+import time
+from oauth_utils import (
+    generate_oauth_url, generate_state_token, parse_state_token,
+    exchange_code_for_tokens, encrypt_token, decrypt_token,
+    get_roblox_user_info, refresh_access_token, get_valid_oauth_token,
+    get_presence_with_oauth
+)
+
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+CHECK_INTERVAL = 5
+ROBLOSECURITY_COOKIE = os.environ.get("ROBLOSECURITY_COOKIE", "")
+CHANNEL_UPDATE_COOLDOWN = timedelta(minutes=5)  # Discord rate limit: 2 changes per 10 min
+last_channel_updates = {}  # Track last update time for each channel
+
+app = Flask(__name__)
+csrf_token = None
+
+# Rate limiting and caching
+presence_cache = {}
+per_user_presence_cache = {}  # Cache per (user_id, player_id) combo
+CACHE_TTL = 15
+rate_limit_backoff = 0
+last_request_time = 0
+rate_limit_count = 0
+
+class MyBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.guilds = True
+        intents.reactions = True
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.ticket_messages = {}  # Store message IDs for ticket reactions
+    
+    async def setup_hook(self):
+        await self.tree.sync()
+
+bot = MyBot()
+
+async def get_csrf_token():
+    global csrf_token
+    
+    if not ROBLOSECURITY_COOKIE:
+        return None
+    
+    try:
+        cookies = {".ROBLOSECURITY": ROBLOSECURITY_COOKIE}
+        timeout = aiohttp.ClientTimeout(total=10)
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                "https://auth.roblox.com/v2/login",
+                cookies=cookies
+            ) as response:
+                if "x-csrf-token" in response.headers:
+                    csrf_token = response.headers["x-csrf-token"]
+                    return csrf_token
+        
+        return None
+    except Exception as e:
+        print(f"Error getting CSRF token: {e}")
+        return None
+
+async def get_presences(user_ids):
+    global csrf_token, rate_limit_backoff, last_request_time, rate_limit_count, presence_cache
+    
+    current_time = time.time()
+    
+    # Check cache first
+    cached_results = []
+    uncached_ids = []
+    
+    for user_id in user_ids:
+        if user_id in presence_cache:
+            cache_entry = presence_cache[user_id]
+            if current_time - cache_entry['timestamp'] < CACHE_TTL:
+                cached_results.append(cache_entry['data'])
+            else:
+                uncached_ids.append(user_id)
+                del presence_cache[user_id]
+        else:
+            uncached_ids.append(user_id)
+    
+    # If all cached, return immediately
+    if not uncached_ids:
+        return cached_results
+    
+    # Apply rate limit backoff
+    if rate_limit_backoff > 0:
+        wait_time = min(rate_limit_backoff, 60)
+        if current_time - last_request_time < wait_time:
+            print(f"⏳ Rate limit backoff active: waiting {wait_time:.1f}s")
+            await asyncio.sleep(wait_time - (current_time - last_request_time))
+    
+    try:
+        url = "https://presence.roblox.com/v1/presence/users"
+        payload = {"userIds": uncached_ids}
+        headers = {}
+        cookies = {}
+        timeout = aiohttp.ClientTimeout(total=10)
+        
+        if ROBLOSECURITY_COOKIE:
+            cookies = {".ROBLOSECURITY": ROBLOSECURITY_COOKIE}
+            
+            if not csrf_token:
+                await get_csrf_token()
+            
+            if csrf_token:
+                headers["x-csrf-token"] = csrf_token
+        
+        last_request_time = time.time()
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload, headers=headers, cookies=cookies) as response:
+                if response.status == 429:
+                    rate_limit_count += 1
+                    rate_limit_backoff = min(2 ** rate_limit_count, 60)
+                    print(f"⚠️ Rate limited (429)! Backoff: {rate_limit_backoff}s (attempt #{rate_limit_count})")
+                    return cached_results
+                
+                if response.status == 403 and "x-csrf-token" in response.headers:
+                    csrf_token = response.headers["x-csrf-token"]
+                    headers["x-csrf-token"] = csrf_token
+                    async with session.post(url, json=payload, headers=headers, cookies=cookies) as retry_response:
+                        if retry_response.status == 429:
+                            rate_limit_count += 1
+                            rate_limit_backoff = min(2 ** rate_limit_count, 60)
+                            print(f"⚠️ Rate limited (429)! Backoff: {rate_limit_backoff}s")
+                            return cached_results
+                        
+                        if retry_response.status == 401:
+                            print("ERROR: Authentication failed. Please check your ROBLOSECURITY_COOKIE")
+                            return cached_results
+                        
+                        retry_response.raise_for_status()
+                        data = await retry_response.json()
+                        presences = data.get("userPresences", [])
+                        
+                        # Cache successful results
+                        for presence in presences:
+                            user_id = presence.get("userId")
+                            presence_cache[user_id] = {
+                                'data': presence,
+                                'timestamp': time.time()
+                            }
+                        
+                        # Reset backoff on success
+                        rate_limit_backoff = max(0, rate_limit_backoff - 1)
+                        rate_limit_count = max(0, rate_limit_count - 1)
+                        
+                        return cached_results + presences
+                
+                if response.status == 401:
+                    print("ERROR: Authentication failed. Please check your ROBLOSECURITY_COOKIE")
+                    return cached_results
+                
+                response.raise_for_status()
+                data = await response.json()
+                presences = data.get("userPresences", [])
+                
+                # Cache successful results
+                for presence in presences:
+                    user_id = presence.get("userId")
+                    presence_cache[user_id] = {
+                        'data': presence,
+                        'timestamp': time.time()
+                    }
+                
+                # Reset backoff on success
+                rate_limit_backoff = max(0, rate_limit_backoff - 1)
+                rate_limit_count = max(0, rate_limit_count - 1)
+                
+                return cached_results + presences
+                
+    except Exception as e:
+        print(f"Error fetching presences: {e}")
+        return cached_results
+
+async def get_username(user_id):
+    try:
+        url = "https://users.roblox.com/v1/users"
+        payload = {"userIds": [user_id], "excludeBannedUsers": False}
+        timeout = aiohttp.ClientTimeout(total=10)
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload) as response:
+                response.raise_for_status()
+                data = await response.json()
+                
+                for user in data.get("data", []):
+                    if user.get("id") == user_id:
+                        return user.get("name", f"User{user_id}")
+                
+                return f"User{user_id}"
+    except Exception as e:
+        print(f"Error fetching username: {e}")
+        return f"User{user_id}"
+
+async def get_avatar_url(user_id):
+    try:
+        url = f"https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={user_id}&size=150x150&format=Png"
+        timeout = aiohttp.ClientTimeout(total=10)
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                data = await response.json()
+                
+                if data.get("data") and len(data["data"]) > 0:
+                    return data["data"][0].get("imageUrl")
+                
+                return None
+    except Exception as e:
+        print(f"Error fetching avatar: {e}")
+        return None
+
+async def check_following(follower_id: int, following_id: int) -> bool:
+    """Check if follower_id follows following_id on Roblox (exhausts full pagination with loop detection)"""
+    try:
+        base_url = f"https://friends.roblox.com/v1/users/{follower_id}/followings"
+        timeout = aiohttp.ClientTimeout(total=60)
+        cursor = None
+        pages_checked = 0
+        seen_cursors = set()
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while True:
+                url = f"{base_url}?limit=100" + (f"&cursor={cursor}" if cursor else "")
+                
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        print(f"Following check failed with status {response.status}")
+                        return False
+                    
+                    data = await response.json()
+                    followings = data.get("data", [])
+                    
+                    for user in followings:
+                        if user.get("id") == following_id:
+                            print(f"✓ Found follower relationship: {follower_id} follows {following_id} (checked {pages_checked + 1} pages)")
+                            return True
+                    
+                    next_cursor = data.get("nextPageCursor")
+                    
+                    if not next_cursor:
+                        return False
+                    
+                    if next_cursor in seen_cursors:
+                        print(f"⚠️ CURSOR LOOP DETECTED: Following check stopped due to repeated cursor (checked {pages_checked + 1} pages)")
+                        return False
+                    
+                    seen_cursors.add(next_cursor)
+                    cursor = next_cursor
+                    pages_checked += 1
+        
+    except Exception as e:
+        print(f"Error checking following status: {e}")
+        return False
+
+async def follow_player(player_id: int) -> bool:
+    """Follow a player on Roblox"""
+    try:
+        global csrf_token
+        if not csrf_token:
+            await get_csrf_token()
+        
+        url = f"https://friends.roblox.com/v1/users/{player_id}/follow"
+        cookies = {".ROBLOSECURITY": ROBLOSECURITY_COOKIE}
+        
+        # Add browser-like headers to avoid CAPTCHA detection
+        headers = {
+            "x-csrf-token": csrf_token,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"https://www.roblox.com/users/{player_id}/profile",
+            "Origin": "https://www.roblox.com",
+            "Content-Type": "application/json"
+        }
+        timeout = aiohttp.ClientTimeout(total=10)
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, cookies=cookies) as response:
+                response_text = await response.text()
+                
+                if response.status == 403 and "x-csrf-token" in response.headers:
+                    print(f"   Refreshing CSRF token and retrying follow...")
+                    csrf_token = response.headers["x-csrf-token"]
+                    headers["x-csrf-token"] = csrf_token
+                    async with session.post(url, headers=headers, cookies=cookies) as retry_response:
+                        retry_text = await retry_response.text()
+                        if retry_response.status == 200:
+                            print(f"   ✓ Bot now follows player {player_id} (after CSRF refresh)")
+                            return True
+                        elif retry_response.status == 400:
+                            # Check if already following
+                            if "already" in retry_text.lower():
+                                print(f"   ℹ️ Bot already follows player {player_id}")
+                                return True
+                            else:
+                                print(f"   ✗ Cannot follow player {player_id}: {retry_text}")
+                                return False
+                        else:
+                            print(f"   ✗ Follow retry failed: {retry_response.status}, Response: {retry_text}")
+                            return False
+                
+                if response.status == 200:
+                    print(f"   ✓ Bot now follows player {player_id}")
+                    return True
+                elif response.status == 400:
+                    # Check if already following
+                    if "already" in response_text.lower():
+                        print(f"   ℹ️ Bot already follows player {player_id}")
+                        return True
+                    else:
+                        print(f"   ✗ Cannot follow player {player_id}: {response_text}")
+                        return False
+                
+                print(f"   ✗ Failed to follow player {player_id}: status {response.status}, Response: {response_text}")
+                return False
+    except Exception as e:
+        print(f"   ✗ Error following player: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+async def unfollow_player(player_id: int) -> bool:
+    """Unfollow a player on Roblox"""
+    try:
+        global csrf_token
+        if not csrf_token:
+            await get_csrf_token()
+        
+        url = f"https://friends.roblox.com/v1/users/{player_id}/unfollow"
+        cookies = {".ROBLOSECURITY": ROBLOSECURITY_COOKIE}
+        
+        # Add browser-like headers to avoid detection
+        headers = {
+            "x-csrf-token": csrf_token,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"https://www.roblox.com/users/{player_id}/profile",
+            "Origin": "https://www.roblox.com",
+            "Content-Type": "application/json"
+        }
+        timeout = aiohttp.ClientTimeout(total=10)
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, cookies=cookies) as response:
+                if response.status == 403 and "x-csrf-token" in response.headers:
+                    csrf_token = response.headers["x-csrf-token"]
+                    headers["x-csrf-token"] = csrf_token
+                    async with session.post(url, headers=headers, cookies=cookies) as retry_response:
+                        if retry_response.status == 200:
+                            print(f"✓ Bot unfollowed player {player_id}")
+                            return True
+                        return False
+                
+                if response.status == 200:
+                    print(f"✓ Bot unfollowed player {player_id}")
+                    return True
+                
+                print(f"Failed to unfollow player {player_id}: status {response.status}")
+                return False
+    except Exception as e:
+        print(f"Error unfollowing player: {e}")
+        return False
+
+async def get_presence_for_user(player_id: int, discord_user_id: int):
+    """Get presence for a player using a specific user's OAuth token"""
+    global per_user_presence_cache
+    
+    cache_key = (discord_user_id, player_id)
+    current_time = time.time()
+    
+    # Check per-user cache
+    if cache_key in per_user_presence_cache:
+        cache_entry = per_user_presence_cache[cache_key]
+        if current_time - cache_entry['timestamp'] < CACHE_TTL:
+            return cache_entry['data'], cache_entry.get('using_oauth', False)
+    
+    # Try to get user's OAuth token
+    access_token = await get_valid_oauth_token(db, discord_user_id)
+    
+    if access_token:
+        # Use OAuth token
+        presences = await get_presence_with_oauth([player_id], access_token)
+        if presences:
+            presence_data = presences[0] if presences else None
+            per_user_presence_cache[cache_key] = {
+                'data': presence_data,
+                'timestamp': current_time,
+                'using_oauth': True
+            }
+            return presence_data, True
+    
+    # Fallback to bot cookie
+    presences = await get_presences([player_id])
+    if presences:
+        presence_data = presences[0] if presences else None
+        per_user_presence_cache[cache_key] = {
+            'data': presence_data,
+            'timestamp': current_time,
+            'using_oauth': False
+        }
+        return presence_data, False
+    
+    return None, False
+
+async def detect_privacy_level(player_id: int) -> str:
+    """Detect player's privacy level by checking before/after follow"""
+    try:
+        print(f"🔍 Detecting privacy level for player {player_id}...")
+        
+        # Initial check - get_presences returns a LIST
+        initial_presence_list = await get_presences([player_id])
+        initial_data = {}
+        if initial_presence_list:
+            for presence in initial_presence_list:
+                if presence.get("userId") == player_id:
+                    initial_data = presence
+                    break
+        
+        initial_type = initial_data.get("userPresenceType", 0)
+        initial_place = initial_data.get("placeId")
+        initial_game = initial_data.get("gameId")
+        
+        print(f"   Initial: type={initial_type}, placeId={initial_place}, gameId={initial_game}")
+        
+        # If we have full data, it's public
+        if initial_type == 2 and initial_place and initial_game:
+            print(f"   ✅ Privacy: PUBLIC (everyone can see)")
+            return "public"
+        
+        # Try to follow the player
+        follow_success = await follow_player(player_id)
+        if not follow_success:
+            # Follow failed (403) - player may have disabled follows
+            # Try to detect based on what we can see
+            if initial_type in [2, 3] and not initial_place:
+                # Player is in game/studio but we can't see it - restricted privacy
+                print(f"   ⚠️ Can't follow (403), but player in game with no data = FOLLOWERS_ONLY")
+                return "followers_only"
+            elif initial_type == 1 and not initial_place:
+                # Player online but no game data
+                print(f"   ⚠️ Can't follow (403), player online with no game data = FOLLOWERS_ONLY")
+                return "followers_only"  
+            elif initial_type == 0:
+                # Player offline, can't determine
+                print(f"   ⚠️ Can't follow player and they're offline - cannot determine privacy")
+                return "unknown"
+            else:
+                print(f"   ⚠️ Could not follow player - assuming restricted privacy")
+                return "followers_only"
+        
+        # Wait a moment for follow to register
+        await asyncio.sleep(2)
+        
+        # IMPORTANT: Clear cache to force fresh API call after following
+        global presence_cache
+        if player_id in presence_cache:
+            del presence_cache[player_id]
+        
+        # Check again after following - get_presences returns a LIST (fresh from API)
+        after_presence_list = await get_presences([player_id])
+        after_data = {}
+        if after_presence_list:
+            for presence in after_presence_list:
+                if presence.get("userId") == player_id:
+                    after_data = presence
+                    break
+        
+        after_type = after_data.get("userPresenceType", 0)
+        after_place = after_data.get("placeId")
+        after_game = after_data.get("gameId")
+        
+        print(f"   After follow: type={after_type}, placeId={after_place}, gameId={after_game}")
+        
+        # Compare results - check if data became available after follow
+        has_initial_game_data = initial_place and initial_game
+        has_after_game_data = after_place and after_game
+        
+        # If we got game data after following but didn't have it before
+        if not has_initial_game_data and has_after_game_data:
+            print(f"   ✅ Privacy: FOLLOWERS ONLY (game data appeared after follow)")
+            return "followers_only"
+        # If type changed (e.g., offline to online after follow)
+        elif initial_type != after_type:
+            print(f"   ✅ Privacy: FOLLOWERS ONLY (status changed after follow)")
+            return "followers_only"
+        # Still no data after follow - probably friends only or offline
+        elif not has_after_game_data and after_type == 0:
+            print(f"   ✅ Privacy: FRIENDS ONLY or STATUS OFF (no data even after follow)")
+            return "friends_only_or_off"
+        # Still no game data but online/in game - might be friends only with player actually in game
+        elif not has_after_game_data and after_type in [1, 2]:
+            print(f"   ✅ Privacy: FRIENDS ONLY (in game but no details even after follow)")
+            return "friends_only_or_off"
+        # Had data before follow - truly public
+        elif has_initial_game_data:
+            print(f"   ✅ Privacy: PUBLIC (had data before follow)")
+            return "public"
+        else:
+            print(f"   ⚠️ Privacy: UNKNOWN (unclear state)")
+            return "unknown"
+            
+    except Exception as e:
+        print(f"Error detecting privacy level: {e}")
+        import traceback
+        traceback.print_exc()
+        return "unknown"
+
+async def get_or_create_category(guild):
+    """Get or create the 'Tracked Players' category"""
+    try:
+        # Check if we have a stored category ID
+        stored_category_id = await db.get_category(guild.id)
+        
+        if stored_category_id:
+            # Try to fetch the existing category
+            category = discord.utils.get(guild.categories, id=stored_category_id)
+            if category:
+                return category
+        
+        # Category doesn't exist or was deleted, create a new one
+        category = await guild.create_category(
+            name="Tracked Players",
+            overwrites={
+                guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+            }
+        )
+        
+        # Store the category ID
+        await db.set_category(guild.id, category.id)
+        print(f"Created category 'Tracked Players' (ID: {category.id})")
+        
+        return category
+    except Exception as e:
+        print(f"Error getting/creating category: {e}")
+        return None
+
+async def create_player_channel(guild, player_id, username):
+    """Create a private channel for a player inside the Tracked Players category"""
+    try:
+        channel_name = f"tracker-{username.lower()}"
+        
+        # Get or create the category
+        category = await get_or_create_category(guild)
+        
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+        }
+        
+        channel = await guild.create_text_channel(
+            name=channel_name,
+            category=category,
+            overwrites=overwrites,
+            topic=f"Real-time status updates for Roblox player: {username}"
+        )
+        
+        await db.add_channel(channel.id, player_id, guild.id)
+        
+        print(f"Created channel #{channel_name} (ID: {channel.id}) for player {username} in category")
+        return channel
+    except Exception as e:
+        print(f"Error creating channel: {e}")
+        return None
+
+async def update_channel_permissions(channel, user_id, grant=True):
+    """Grant or revoke channel access for a user"""
+    try:
+        member = await channel.guild.fetch_member(user_id)
+        if grant:
+            await channel.set_permissions(member, read_messages=True, send_messages=True)
+        else:
+            await channel.set_permissions(member, overwrite=None)
+    except Exception as e:
+        print(f"Error updating channel permissions: {e}")
+
+async def update_channel_title(channel, status_emoji, username, status_text):
+    """Placeholder function - channel titles are now static (tracker-playername)"""
+    # Channel titles no longer update with emoji status
+    # They remain as "tracker-playername" format
+    pass
+
+@bot.tree.command(name="track", description="Track a Roblox player's status")
+@app_commands.describe(player_name="The Roblox username to track")
+async def track_command(interaction: discord.Interaction, player_name: str):
+    await interaction.response.defer(ephemeral=True)
+    
+    if not interaction.guild_id:
+        await interaction.followup.send("❌ This command can only be used in a server!", ephemeral=True)
+        return
+    
+    # Check if user has OAuth linked, suggest linking if not
+    has_oauth = await db.get_user_with_oauth(interaction.user.id)
+    if not has_oauth:
+        await interaction.followup.send(
+            "💡 **Tip:** Link your Roblox account with `/link-roblox` for better tracking!\n"
+            "• See players with privacy settings\n"
+            "• No CAPTCHA issues\n"
+            "• Uses YOUR Roblox permissions\n\n"
+            "Continuing with basic tracking...",
+            ephemeral=True
+        )
+    
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        player_id = None
+        username = None
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Try username to ID endpoint first (more reliable)
+            username_url = f"https://users.roblox.com/v1/usernames/users"
+            payload = {"usernames": [player_name], "excludeBannedUsers": False}
+            
+            async with session.post(username_url, json=payload) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("data") and len(data["data"]) > 0:
+                        player_id = data["data"][0]["id"]
+                        username = data["data"][0]["name"]
+            
+            # Fallback to search if username lookup failed
+            if not player_id:
+                search_url = f"https://users.roblox.com/v1/users/search?keyword={player_name}&limit=1"
+                async with session.get(search_url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("data") and len(data["data"]) > 0:
+                            player_id = data["data"][0]["id"]
+                            username = data["data"][0]["name"]
+        
+        if not player_id or not username:
+            await interaction.followup.send(f"❌ Player '{player_name}' not found! Make sure the username is spelled correctly.", ephemeral=True)
+            return
+        
+        # Check if user is already tracking this player (pure query, no side effects)
+        if await db.is_user_tracking_player(interaction.user.id, player_id, interaction.guild_id):
+            await interaction.followup.send(f"⚠️ You're already tracking **{username}**!", ephemeral=True)
+            return
+        
+        # Check tier limits (includes guild-wide tier if applicable)
+        current_count = await db.get_user_player_count(interaction.user.id, interaction.guild_id)
+        user_tier = await db.get_user_tier(interaction.user.id, interaction.guild_id)
+        max_players = user_tier['max_players']
+        
+        if current_count >= max_players:
+            tier_name = user_tier['tier'].title()
+            embed = discord.Embed(
+                title="🔒 Player Limit Reached!",
+                description=f"You've reached your **{tier_name}** tier limit of **{max_players} player(s)**.",
+                color=discord.Color.red()
+            )
+            embed.add_field(
+                name="Upgrade Options",
+                value="**🆓 Free:** 1 player\n**💎 Basic ($1.99 / 200 Robux):** 3 players\n**⚡ Starter ($3.99 / 400 Robux):** 5 players\n**⭐ Pro ($9.99 / 1000 Robux):** 10 players\n**🔥 Premium ($19.99 / 1600 Robux):** Unlimited",
+                inline=False
+            )
+            embed.add_field(
+                name="How to Upgrade",
+                value="Use `/upgrade` to see payment options!",
+                inline=False
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+        
+        await db.add_player(player_id, username)
+        
+        # Detect privacy level and auto-follow/unfollow
+        # Always re-detect privacy to get latest status with current cookie
+        privacy_level = await detect_privacy_level(player_id)
+        await db.update_privacy_level(player_id, privacy_level)
+        
+        # Handle follow based on privacy
+        player_info = await db.get_player_info(player_id)
+        if privacy_level == 'public':
+            # Public - unfollow if following
+            if player_info and player_info.get('followed_by_bot'):
+                await unfollow_player(player_id)
+                await db.update_follow_status(player_id, False)
+        elif privacy_level in ['followers_only', 'friends_only_or_off', 'unknown']:
+            # Restricted - keep following (already followed during detection)
+            await db.update_follow_status(player_id, True)
+        
+        channel_id = await db.get_channel_for_player(player_id, interaction.guild_id)
+        channel = None
+        
+        if channel_id:
+            channel = bot.get_channel(channel_id)
+            if not channel:
+                await db.delete_channel(player_id, interaction.guild_id)
+                channel_id = None
+        
+        if not channel:
+            channel = await create_player_channel(interaction.guild, player_id, username)
+            if not channel:
+                await interaction.followup.send("❌ Failed to create tracking channel!", ephemeral=True)
+                return
+            channel_id = channel.id
+        
+        await db.add_subscriber(interaction.user.id, player_id, interaction.guild_id)
+        
+        if channel:
+            await update_channel_permissions(channel, interaction.user.id, grant=True)
+        
+        # Create confirmation embed with privacy info
+        privacy_emoji = {
+            'public': '🌐',
+            'followers_only': '👥',
+            'friends_only_or_off': '🔒',
+            'unknown': '❓'
+        }
+        privacy_text = {
+            'public': 'Public (Everyone can see)',
+            'followers_only': 'Followers Only (Bot is following)',
+            'friends_only_or_off': 'Friends Only/Status Off (Limited tracking)',
+            'unknown': 'Unknown'
+        }
+        
+        embed = discord.Embed(
+            title=f"✅ Now Tracking {username}!",
+            description=f"Check <#{channel_id}> for real-time updates.",
+            color=discord.Color.green()
+        )
+        embed.add_field(
+            name=f"{privacy_emoji.get(privacy_level, '❓')} Privacy Status",
+            value=privacy_text.get(privacy_level, 'Unknown'),
+            inline=False
+        )
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        print(f"{interaction.user.name} subscribed to {username} (ID: {player_id}, Privacy: {privacy_level})")
+        
+    except Exception as e:
+        print(f"Error in track command: {e}")
+        await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="untrack", description="Stop tracking a Roblox player")
+@app_commands.describe(player_name="The Roblox username to stop tracking")
+async def untrack_command(interaction: discord.Interaction, player_name: str):
+    await interaction.response.defer(ephemeral=True)
+    
+    if not interaction.guild_id:
+        await interaction.followup.send("❌ This command can only be used in a server!", ephemeral=True)
+        return
+    
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        player_id = None
+        username = None
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Try username to ID endpoint first (more reliable)
+            username_url = f"https://users.roblox.com/v1/usernames/users"
+            payload = {"usernames": [player_name], "excludeBannedUsers": False}
+            
+            async with session.post(username_url, json=payload) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("data") and len(data["data"]) > 0:
+                        player_id = data["data"][0]["id"]
+                        username = data["data"][0]["name"]
+            
+            # Fallback to search if username lookup failed
+            if not player_id:
+                search_url = f"https://users.roblox.com/v1/users/search?keyword={player_name}&limit=1"
+                async with session.get(search_url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("data") and len(data["data"]) > 0:
+                            player_id = data["data"][0]["id"]
+                            username = data["data"][0]["name"]
+        
+        if not player_id or not username:
+            await interaction.followup.send(f"❌ Player '{player_name}' not found! Make sure the username is spelled correctly.", ephemeral=True)
+            return
+        
+        removed = await db.remove_subscriber(interaction.user.id, player_id, interaction.guild_id)
+        
+        if not removed:
+            await interaction.followup.send(f"❌ You are not tracking {username}!", ephemeral=True)
+            return
+        
+        channel_id = await db.get_channel_for_player(player_id, interaction.guild_id)
+        if channel_id:
+            channel = bot.get_channel(channel_id)
+            if channel and hasattr(channel, 'delete'):
+                await update_channel_permissions(channel, interaction.user.id, grant=False)
+                
+                subscriber_count = await db.get_subscriber_count(player_id, interaction.guild_id)
+                if subscriber_count == 0:
+                    await channel.delete()
+                    await db.delete_channel(player_id, interaction.guild_id)
+                    print(f"Deleted channel for {username} (no subscribers)")
+                    
+                    # Clear status cache if no subscribers left anywhere (forces notification on re-track)
+                    total_subscribers = await db.get_total_subscriber_count(player_id)
+                    if total_subscribers == 0:
+                        await db.clear_player_status(player_id)
+                        print(f"Cleared status cache for {username} (no subscribers anywhere)")
+        
+        await interaction.followup.send(f"✅ Stopped tracking **{username}**!", ephemeral=True)
+        print(f"{interaction.user.name} unsubscribed from {username}")
+        
+    except Exception as e:
+        print(f"Error in untrack command: {e}")
+        await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="mystatus", description="View all players you're tracking")
+async def mystatus_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    
+    if not interaction.guild_id:
+        await interaction.followup.send("❌ This command can only be used in a server!", ephemeral=True)
+        return
+    
+    try:
+        subscriptions = await db.get_user_subscriptions(interaction.user.id, interaction.guild_id)
+        
+        if not subscriptions:
+            await interaction.followup.send("❌ You are not tracking any players!", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title="📊 Your Tracked Players",
+            color=discord.Color.blue()
+        )
+        
+        for sub in subscriptions:
+            channel_mention = f"<#{sub['channel_id']}>" if sub['channel_id'] else "No channel"
+            embed.add_field(
+                name=sub['username'],
+                value=f"ID: {sub['player_id']}\nChannel: {channel_mention}",
+                inline=True
+            )
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        print(f"Error in mystatus command: {e}")
+        await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="upgrade", description="View pricing and upgrade options")
+async def upgrade_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        user_tier = await db.get_user_tier(interaction.user.id, interaction.guild_id)
+        current_tier = user_tier['tier'].title()
+        
+        embed = discord.Embed(
+            title="💰 Upgrade Your Tracking Plan",
+            description=f"**Current Plan:** {current_tier} ({user_tier['max_players']} players max)",
+            color=discord.Color.gold()
+        )
+        
+        embed.add_field(
+            name="🆓 Free Tier",
+            value="• 1 player max\n• 30-second updates\n• Basic features",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="💎 Basic Pack - $1.99 (200 Robux)",
+            value="• **3 players max**\n• **5-second ultra-fast updates**\n• Lifetime access!",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="⚡ Starter Pack - $3.99 (400 Robux)",
+            value="• **5 players max**\n• **5-second ultra-fast updates**\n• Lifetime access!",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="⭐ Pro Pack - $9.99 (1000 Robux)",
+            value="• **10 players max**\n• **5-second ultra-fast updates**\n• Lifetime access!",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🔥 Premium - $19.99 (1600 Robux)",
+            value="• **Unlimited players**\n• **5-second ultra-fast updates**\n• All features unlocked",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="💳 How to Purchase",
+            value="React to the pricing message to create a purchase ticket!\n**Payment Options:** PayPal/USD or Robux gamepass (direct links in `/verify`)",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="⚠️ Important Note",
+            value="**Privacy Limitation:** If a tracked player has their privacy set to 'only people I follow', the bot can only see their game status if they follow the bot's account. This is a Roblox platform limitation.",
+            inline=False
+        )
+        
+        embed.set_footer(text="All purchases = lifetime access!")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        print(f"Error in upgrade command: {e}")
+        await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="admin-upgrade", description="[ADMIN] Manually upgrade a user")
+@app_commands.describe(
+    tier="Tier to assign (basic/starter/premium)",
+    user="The user to upgrade"
+)
+async def admin_upgrade_command(interaction: discord.Interaction, tier: str, user: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+    
+    # Check if user is admin
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ This command is admin-only!", ephemeral=True)
+        return
+    
+    try:
+        tier = tier.lower()
+        tier_configs = {
+            'basic': {'max_players': 3, 'check_interval': 5},
+            'starter': {'max_players': 5, 'check_interval': 5},
+            'pro': {'max_players': 10, 'check_interval': 5},
+            'premium': {'max_players': 999, 'check_interval': 5}
+        }
+        
+        if tier not in tier_configs:
+            await interaction.followup.send(
+                f"❌ Invalid tier! Use: `basic`, `starter`, `pro`, or `premium`",
+                ephemeral=True
+            )
+            return
+        
+        config = tier_configs[tier]
+        
+        await db.set_user_tier(
+            user.id,
+            tier,
+            config['max_players'],
+            config['check_interval']
+        )
+        
+        await interaction.followup.send(
+            f"✅ Upgraded {user.mention} to **{tier.title()}** tier (lifetime)!",
+            ephemeral=True
+        )
+        
+        # Notify the user
+        try:
+            await user.send(
+                f"🎉 You've been upgraded to **{tier.title()}** tier!\n\n"
+                f"• Max players: {config['max_players']}\n"
+                f"• Check interval: {config['check_interval']} seconds\n"
+                f"• Lifetime access!\n\n"
+                f"Use `/track` to start tracking players!"
+            )
+        except:
+            pass
+        
+        print(f"Admin {interaction.user.name} upgraded {user.name} to {tier}")
+        
+    except Exception as e:
+        print(f"Error in admin-upgrade command: {e}")
+        await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="verify", description="Verify Robux gamepass purchase to unlock tier")
+@app_commands.describe(roblox_username="Your Roblox username")
+async def verify_command(interaction: discord.Interaction, roblox_username: str):
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        # Get Roblox user ID
+        timeout = aiohttp.ClientTimeout(total=10)
+        player_id = None
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            username_url = f"https://users.roblox.com/v1/usernames/users"
+            payload = {"usernames": [roblox_username], "excludeBannedUsers": False}
+            
+            async with session.post(username_url, json=payload) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("data") and len(data["data"]) > 0:
+                        player_id = data["data"][0]["id"]
+        
+        if not player_id:
+            await interaction.followup.send(
+                f"❌ Roblox user '{roblox_username}' not found!",
+                ephemeral=True
+            )
+            return
+        
+        # Check gamepass ownership (you'll need to set up gamepass IDs)
+        # For now, send instructions
+        embed = discord.Embed(
+            title="🎮 Robux Gamepass Verification",
+            description="To verify your purchase:",
+            color=discord.Color.blue()
+        )
+        
+        embed.add_field(
+            name="Step 1: Buy Gamepass",
+            value="Purchase your tier directly on Roblox:\n"
+                  "• **[Basic Pass - 200 Robux](https://www.roblox.com/game-pass/1530134608)**\n"
+                  "• **[Starter Pass - 400 Robux](https://www.roblox.com/game-pass/1530302698)**\n"
+                  "• **[Pro Pass - 1000 Robux](https://www.roblox.com/game-pass/1530508463)**\n"
+                  "• **[Premium Pass - 1600 Robux](https://www.roblox.com/game-pass/1530264559)**",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Step 2: Wait & Verify",
+            value=f"Gamepass ownership check for **{roblox_username}** (ID: {player_id})\n\n"
+                  "⚠️ **Setup Required:** Contact admin to configure gamepass IDs in the bot code",
+            inline=False
+        )
+        
+        embed.set_footer(text="Automatic verification coming soon!")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        print(f"Error in verify command: {e}")
+        await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="link-roblox", description="Link your Roblox account with OAuth for enhanced tracking")
+async def link_roblox_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        has_oauth = await db.get_user_with_oauth(interaction.user.id)
+        
+        if has_oauth:
+            link = await db.get_roblox_link(interaction.user.id)
+            username = link['roblox_username'] if link else "Unknown"
+            await interaction.followup.send(
+                f"✅ You already have a Roblox account linked: **{username}**\n\n"
+                f"Use `/unlink-roblox` to unlink and link a different account.",
+                ephemeral=True
+            )
+            return
+        
+        state = generate_state_token(interaction.user.id)
+        oauth_url = generate_oauth_url(state)
+        
+        if not oauth_url:
+            await interaction.followup.send(
+                "❌ **OAuth is not configured**\n\n"
+                "The bot administrator needs to set up OAuth credentials in the Secrets panel:\n"
+                "- ROBLOX_CLIENT_ID\n"
+                "- ROBLOX_CLIENT_SECRET\n"
+                "- OAUTH_REDIRECT_URI\n\n"
+                "Contact an admin for help.",
+                ephemeral=True
+            )
+            return
+        
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(
+            label="🔐 Login with Roblox",
+            url=oauth_url,
+            style=discord.ButtonStyle.link
+        ))
+        
+        await interaction.followup.send(
+            "🔐 **Link Your Roblox Account**\n\n"
+            "Click the button below to securely authorize your Roblox account:\n\n"
+            "✅ **Benefits:**\n"
+            "• Use YOUR Roblox permissions for tracking\n"
+            "• No CAPTCHA issues\n"
+            "• See players you follow (privacy-restricted)\n"
+            "• Secure OAuth 2.0 authentication\n\n"
+            "⚡ **One-click setup** - Just click \"Authorize\" on Roblox!",
+            view=view,
+            ephemeral=True
+        )
+        
+    except Exception as e:
+        print(f"Error in link-roblox command: {e}")
+        await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="unlink-roblox", description="Unlink your Roblox account and revoke OAuth access")
+async def unlink_roblox_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        link = await db.get_roblox_link(interaction.user.id)
+        
+        if not link:
+            await interaction.followup.send("❌ You don't have a Roblox account linked!", ephemeral=True)
+            return
+        
+        await db.unlink_roblox_account(interaction.user.id)
+        await db.delete_oauth_tokens(interaction.user.id)
+        
+        await interaction.followup.send(
+            f"✅ **Unlinked your Roblox account**\n\n"
+            f"Removed: **{link['roblox_username']}**\n"
+            f"OAuth tokens have been deleted.\n\n"
+            f"Use `/link-roblox` to link again.",
+            ephemeral=True
+        )
+        
+    except Exception as e:
+        print(f"Error in unlink-roblox command: {e}")
+        await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="setup-tickets", description="[ADMIN] Set up purchase ticket system in this channel")
+async def setup_tickets_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    
+    # Check if user is admin
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ This command is admin-only!", ephemeral=True)
+        return
+    
+    try:
+        embed = discord.Embed(
+            title="💰 Upgrade Your Tracking Plan",
+            description="React with an emoji below to create a purchase ticket!",
+            color=discord.Color.gold()
+        )
+        
+        embed.add_field(
+            name="🆓 Free Tier",
+            value="• 1 player max\n• 30-second updates",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="💎 Basic Pack - $1.99 (200 Robux)",
+            value="• **3 players max**\n• **5-second ultra-fast updates**\n• Lifetime access!",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="⚡ Starter Pack - $3.99 (400 Robux)",
+            value="• **5 players max**\n• **5-second ultra-fast updates**\n• Lifetime access!",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="⭐ Pro Pack - $9.99 (1000 Robux)",
+            value="• **10 players max**\n• **5-second ultra-fast updates**\n• Lifetime access!",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🔥 Premium - $19.99 (1600 Robux)",
+            value="• **Unlimited players**\n• **5-second ultra-fast updates**\n• All features unlocked",
+            inline=False
+        )
+        
+        embed.set_footer(text="React: 💎 Basic | ⚡ Starter | ⭐ Pro | 🔥 Premium")
+        
+        message = await interaction.channel.send(embed=embed)
+        
+        # Add reactions
+        await message.add_reaction("💎")
+        await message.add_reaction("⚡")
+        await message.add_reaction("⭐")
+        await message.add_reaction("🔥")
+        
+        # Store this message ID for ticket creation (in memory and database)
+        bot.ticket_messages[message.id] = {
+            'channel_id': interaction.channel.id,
+            'guild_id': interaction.guild.id
+        }
+        await db.add_ticket_message(message.id, interaction.channel.id, interaction.guild.id)
+        
+        await interaction.followup.send("✅ Ticket system set up! Users can now react to create tickets.", ephemeral=True)
+        print(f"Ticket system set up in channel {interaction.channel.name}")
+        
+    except Exception as e:
+        print(f"Error in setup-tickets command: {e}")
+        await interaction.followup.send(f"❌ An error occurred: {str(e)}", ephemeral=True)
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    """Handle reactions for ticket creation"""
+    # Ignore bot reactions
+    if payload.user_id == bot.user.id:
+        return
+    
+    # Check if this is a ticket message
+    if payload.message_id not in bot.ticket_messages:
+        return
+    
+    try:
+        # Map emojis to tiers
+        emoji_to_tier = {
+            '💎': {'tier': 'basic', 'name': '💎 Basic Pack', 'price_usd': '$1.99', 'price_robux': '200 Robux', 'players': '3'},
+            '⚡': {'tier': 'starter', 'name': '⚡ Starter Pack', 'price_usd': '$3.99', 'price_robux': '400 Robux', 'players': '5'},
+            '⭐': {'tier': 'pro', 'name': '⭐ Pro Pack', 'price_usd': '$9.99', 'price_robux': '1000 Robux', 'players': '10'},
+            '🔥': {'tier': 'premium', 'name': '🔥 Premium', 'price_usd': '$19.99', 'price_robux': '1600 Robux', 'players': 'Unlimited'}
+        }
+        
+        emoji_name = str(payload.emoji)
+        if emoji_name not in emoji_to_tier:
+            return
+        
+        info = emoji_to_tier[emoji_name]
+        guild = bot.get_guild(payload.guild_id)
+        channel = bot.get_channel(payload.channel_id)
+        user = await guild.fetch_member(payload.user_id)
+        
+        # Create a PUBLIC thread for the purchase ticket
+        thread_name = f"💳 {info['name']} - {user.name}"
+        
+        thread = await channel.create_thread(
+            name=thread_name,
+            type=discord.ChannelType.public_thread
+        )
+        
+        # Create purchase ticket embed
+        embed = discord.Embed(
+            title=f"🎫 Purchase Ticket: {info['name']}",
+            description=f"**Customer:** {user.mention}\n**Tier:** {info['name']}\n**Players:** {info['players']}",
+            color=discord.Color.gold()
+        )
+        
+        embed.add_field(
+            name="💰 Pricing Options",
+            value=f"**PayPal/USD:** {info['price_usd']}\n**Robux Gamepass:** {info['price_robux']}",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📝 Next Steps",
+            value=f"**For PayPal/USD:**\n1. Contact admin with payment\n2. Admin will use `/admin-upgrade {info['tier']} @{user.name}`\n\n**For Robux:**\n1. Click the gamepass link in `/verify` command to purchase\n2. Use `/verify [roblox_username]` to confirm",
+            inline=False
+        )
+        
+        embed.set_footer(text=f"Ticket created by {user.name}")
+        
+        await thread.send(f"{user.mention} - Your purchase ticket for **{info['name']}**!")
+        await thread.send(embed=embed)
+        await thread.send(f"📢 {guild.owner.mention if guild.owner else '@Admin'} - New purchase request!")
+        
+        # Remove the user's reaction to keep the message clean
+        message = await channel.fetch_message(payload.message_id)
+        await message.remove_reaction(payload.emoji, user)
+        
+        print(f"Purchase ticket created via reaction: {info['tier']} for {user.name}")
+        
+    except Exception as e:
+        print(f"Error handling reaction ticket: {e}")
+
+@tasks.loop(seconds=CHECK_INTERVAL)
+async def track_players():
+    try:
+        player_ids = await db.get_all_tracked_players()
+        
+        if not player_ids:
+            return
+        
+        # Get presences using OAuth when available
+        presences_data = []
+        for player_id in player_ids:
+            # Try to find a subscriber with OAuth for this player
+            all_channels = await db.get_channels_for_player(player_id)
+            oauth_user_id = None
+            
+            for channel_info in all_channels:
+                subscribers = await db.get_subscribers_for_player(player_id, channel_info['guild_id'])
+                for sub_id in subscribers:
+                    if await db.get_user_with_oauth(sub_id):
+                        oauth_user_id = sub_id
+                        break
+                if oauth_user_id:
+                    break
+            
+            # Get presence using OAuth if available, otherwise use bot cookie
+            if oauth_user_id:
+                presence, using_oauth = await get_presence_for_user(player_id, oauth_user_id)
+                if presence:
+                    presence['_using_oauth'] = using_oauth
+                    presences_data.append(presence)
+            else:
+                # Fallback to bot cookie
+                fallback_presences = await get_presences([player_id])
+                if fallback_presences:
+                    fallback_presences[0]['_using_oauth'] = False
+                    presences_data.append(fallback_presences[0])
+        
+        for presence in presences_data:
+            user_id = presence.get("userId")
+            user_type = presence.get("userPresenceType", 0)
+            last_location = presence.get("lastLocation", "")
+            place_id = presence.get("placeId")
+            game_id = presence.get("gameId")
+            join_game_url = None  # Initialize for all status types
+            
+            if user_type == 0:
+                status = "Offline"
+                color = 0xFF0000
+                status_emoji = "🔴"
+                status_text = "Offline"
+                description = "Player is offline"
+                # Will check for followers later to see if they might see different status
+            elif user_type == 1:
+                status = "Online"
+                color = 0x0000FF
+                status_emoji = "🔵"
+                status_text = "Online"
+                description = "Player is online on Roblox"
+            elif user_type == 2:
+                status = "In Game"
+                color = 0x00FF00
+                status_emoji = "🟢"
+                status_text = "In Game"
+                
+                description = f"Playing **{last_location}**"
+                
+                # Debug: log what we got from API
+                print(f"DEBUG - Player {user_id} in game: placeId={place_id}, gameId={game_id}")
+                
+                # Store join game info for button (will be added later)
+                if place_id and game_id:
+                    join_game_url = f"roblox://experiences/start?placeId={place_id}&gameInstanceId={game_id}"
+                elif place_id:
+                    description += f"\n\n⚠️ *Specific server join unavailable (privacy settings)*"
+            elif user_type == 3:
+                status = "In Studio"
+                color = 0xFFA500
+                status_emoji = "🟠"
+                status_text = "In Studio"
+                description = "In **Roblox Studio**"
+            else:
+                status = "Unknown"
+                color = 0x808080
+                status_emoji = "🔴"
+                status_text = "Unknown"
+                description = "Status: Unknown"
+            
+            previous_status = await db.get_player_status(user_id)
+            
+            if previous_status != status:
+                print(f"Status change detected for player {user_id}: {previous_status} -> {status}")
+                
+                username = await get_username(user_id)
+                avatar_url = await get_avatar_url(user_id)
+                
+                channels = await db.get_channels_for_player(user_id)
+                
+                for channel_info in channels:
+                    channel = bot.get_channel(channel_info['channel_id'])
+                    if channel and hasattr(channel, 'send'):
+                        channel_description = description
+                        
+                        # Check if any subscribers follow the tracked player (for enhanced info)
+                        subscribers = await db.get_subscribers_for_player(user_id, channel_info['guild_id'])
+                        
+                        follower_found = False
+                        for subscriber_id in subscribers:
+                            link = await db.get_roblox_link(subscriber_id)
+                            if link:
+                                follows = await check_following(link['roblox_user_id'], user_id)
+                                if follows:
+                                    follower_found = True
+                                    break
+                        
+                        # Enhanced notifications for followers
+                        if follower_found:
+                            if user_type == 0:
+                                # Player appears offline but follower might see different status
+                                channel_description += "\n\n✨ **You follow this player!**\n*They might be online with privacy settings enabled. Check Roblox to see their actual status.*"
+                            elif user_type == 2 and place_id and not game_id:
+                                # Game is being played but we don't have gameId (privacy restriction)
+                                channel_description += "\n\n✨ **You follow this player!**\n*You can see what game they're playing on Roblox.*"
+                            elif user_type == 2 and place_id and game_id:
+                                # Full game info available
+                                channel_description += "\n\n✨ *You follow this player and can join them directly!*"
+                        
+                        embed = discord.Embed(
+                            title=f"{username} Status Update",
+                            description=channel_description,
+                            color=color
+                        )
+                        
+                        if avatar_url:
+                            embed.set_thumbnail(url=avatar_url)
+                        
+                        # Show data source in footer
+                        using_oauth = presence.get('_using_oauth', False)
+                        footer_text = f"Player ID: {user_id}"
+                        if using_oauth:
+                            footer_text += " • Using OAuth (your permissions)"
+                        else:
+                            footer_text += " • Using bot cookie (limited visibility)"
+                        embed.set_footer(text=footer_text)
+                        
+                        # Add join game button (web link) + protocol link in description
+                        view = None
+                        if join_game_url and place_id:
+                            # Discord buttons only support http/https, not roblox:// protocol
+                            # So we use web link for button and show protocol link in embed
+                            web_url = f"https://www.roblox.com/games/{place_id}"
+                            view = discord.ui.View()
+                            join_button = discord.ui.Button(
+                                style=discord.ButtonStyle.link,
+                                label="🌐 Open in Browser",
+                                url=web_url
+                            )
+                            view.add_item(join_button)
+                            
+                            # Add protocol link to embed description for direct app launch
+                            embed.description += f"\n\n**📱 Or copy this link to join directly:**\n`{join_game_url}`"
+                        
+                        await channel.send(embed=embed, view=view)
+                        
+                        await update_channel_title(channel, status_emoji, username, status_text)
+                
+                await db.update_player_status(user_id, status)
+                
+    except Exception as e:
+        print(f"Error in tracking loop: {e}")
+
+@track_players.before_loop
+async def before_tracking():
+    await bot.wait_until_ready()
+    await db.connect()
+    print("Database connected!")
+    
+    # Load ticket messages from database
+    ticket_messages = await db.get_all_ticket_messages()
+    bot.ticket_messages.update(ticket_messages)
+    print(f"Loaded {len(ticket_messages)} ticket messages from database")
+    
+    print("Bot is ready!")
+    print(f"Check interval: {CHECK_INTERVAL} seconds")
+    print("Use /track [player_name] to start tracking!")
+
+def run_server():
+    @app.route('/')
+    def home():
+        return "Roblox Presence Tracker Bot is running! Use /track command in Discord."
+    
+    @app.route('/status')
+    def status():
+        import asyncio
+        from concurrent.futures import TimeoutError
+        try:
+            future = asyncio.run_coroutine_threadsafe(db.get_all_tracked_players(), bot.loop)
+            tracked = future.result(timeout=10)
+            return {"tracking": len(tracked), "players": tracked}
+        except TimeoutError:
+            return {"error": "Database timeout"}, 500
+        except Exception as e:
+            return {"error": str(e)}, 500
+    
+    @app.route('/oauth/callback')
+    def oauth_callback():
+        import asyncio
+        from concurrent.futures import TimeoutError
+        
+        code = request.args.get('code')
+        state = request.args.get('state')
+        error = request.args.get('error')
+        
+        if error:
+            return f'''
+            <html>
+                <body style="font-family: Arial; text-align: center; padding: 50px; background: #ff5555; color: white;">
+                    <h1>❌ Authorization Failed</h1>
+                    <p>Error: {error}</p>
+                    <p>Please try again in Discord</p>
+                </body>
+            </html>
+            ''', 400
+        
+        if not code or not state:
+            return '''
+            <html>
+                <body style="font-family: Arial; text-align: center; padding: 50px; background: #ff5555; color: white;">
+                    <h1>❌ Invalid Request</h1>
+                    <p>Missing authorization code or state</p>
+                </body>
+            </html>
+            ''', 400
+        
+        discord_user_id = parse_state_token(state)
+        if not discord_user_id:
+            return '''
+            <html>
+                <body style="font-family: Arial; text-align: center; padding: 50px; background: #ff5555; color: white;">
+                    <h1>❌ Invalid State Token</h1>
+                    <p>Security check failed</p>
+                </body>
+            </html>
+            ''', 400
+        
+        # Helper coroutine to run all async operations
+        async def process_oauth():
+            tokens = await exchange_code_for_tokens(code)
+            if not tokens:
+                return None, "Token exchange failed"
+            
+            access_token = tokens.get('access_token')
+            refresh_token = tokens.get('refresh_token')
+            expires_in = tokens.get('expires_in', 3600)
+            
+            if not access_token or not refresh_token:
+                return None, "Missing tokens"
+            
+            user_info = await get_roblox_user_info(access_token)
+            if not user_info:
+                return None, "Failed to get user info"
+            
+            roblox_user_id = user_info.get('sub')
+            roblox_username = user_info.get('preferred_username')
+            
+            encrypted_access = encrypt_token(access_token)
+            encrypted_refresh = encrypt_token(refresh_token)
+            from datetime import timezone as tz
+            expires_at = datetime.now(tz.utc) + timedelta(seconds=expires_in)
+            
+            await db.store_oauth_tokens(discord_user_id, encrypted_access, encrypted_refresh, expires_at)
+            await db.link_roblox_account(discord_user_id, int(roblox_user_id), roblox_username)
+            
+            return roblox_username, None
+        
+        # Run on bot's event loop
+        try:
+            future = asyncio.run_coroutine_threadsafe(process_oauth(), bot.loop)
+            result, error_msg = future.result(timeout=30)
+            
+            if error_msg:
+                return f'''
+                <html>
+                    <body style="font-family: Arial; text-align: center; padding: 50px; background: #ff5555; color: white;">
+                        <h1>❌ OAuth Error</h1>
+                        <p>{error_msg}</p>
+                    </body>
+                </html>
+                ''', 500
+            
+            roblox_username = result
+        except TimeoutError:
+            return '''
+            <html>
+                <body style="font-family: Arial; text-align: center; padding: 50px; background: #ff5555; color: white;">
+                    <h1>❌ Timeout</h1>
+                    <p>Request took too long</p>
+                </body>
+            </html>
+            ''', 500
+        except Exception as e:
+            return f'''
+            <html>
+                <body style="font-family: Arial; text-align: center; padding: 50px; background: #ff5555; color: white;">
+                    <h1>❌ Error</h1>
+                    <p>{str(e)}</p>
+                </body>
+            </html>
+            ''', 500
+        
+        return f'''
+        <html>
+            <head>
+                <style>
+                    body {{
+                        font-family: 'Segoe UI', Arial, sans-serif;
+                        text-align: center;
+                        padding: 50px;
+                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                        color: white;
+                        margin: 0;
+                    }}
+                    .success-box {{
+                        background: rgba(255, 255, 255, 0.1);
+                        border-radius: 15px;
+                        padding: 40px;
+                        max-width: 500px;
+                        margin: 0 auto;
+                        backdrop-filter: blur(10px);
+                    }}
+                    h1 {{ margin-bottom: 20px; }}
+                    .username {{ 
+                        font-size: 24px; 
+                        font-weight: bold;
+                        margin: 20px 0;
+                        color: #4ade80;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="success-box">
+                    <h1>✅ Success!</h1>
+                    <p>Your Roblox account has been linked!</p>
+                    <div class="username">{roblox_username}</div>
+                    <p>You can now close this window and return to Discord.</p>
+                    <p style="margin-top: 30px; font-size: 14px; opacity: 0.8;">
+                        Your tracking will now use your Roblox permissions
+                    </p>
+                </div>
+            </body>
+        </html>
+        '''
+    
+    @app.route('/pricing')
+    def pricing():
+        return '''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Roblox Tracker - Pricing</title>
+            <style>
+                body {
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    margin: 0;
+                    padding: 40px 20px;
+                }
+                .container {
+                    max-width: 1200px;
+                    margin: 0 auto;
+                }
+                h1 {
+                    text-align: center;
+                    font-size: 3em;
+                    margin-bottom: 10px;
+                }
+                .subtitle {
+                    text-align: center;
+                    font-size: 1.2em;
+                    opacity: 0.9;
+                    margin-bottom: 50px;
+                }
+                .pricing-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                    gap: 30px;
+                    margin-top: 40px;
+                }
+                .tier-card {
+                    background: rgba(255, 255, 255, 0.1);
+                    border-radius: 20px;
+                    padding: 30px;
+                    backdrop-filter: blur(10px);
+                    border: 2px solid rgba(255, 255, 255, 0.2);
+                    transition: transform 0.3s, border-color 0.3s;
+                }
+                .tier-card:hover {
+                    transform: translateY(-10px);
+                    border-color: rgba(255, 255, 255, 0.5);
+                }
+                .tier-card.popular {
+                    border-color: #FFD700;
+                    box-shadow: 0 10px 40px rgba(255, 215, 0, 0.3);
+                }
+                .tier-icon {
+                    font-size: 3em;
+                    text-align: center;
+                    margin-bottom: 15px;
+                }
+                .tier-name {
+                    font-size: 1.8em;
+                    text-align: center;
+                    margin-bottom: 10px;
+                    font-weight: bold;
+                }
+                .tier-price {
+                    text-align: center;
+                    font-size: 2.5em;
+                    margin-bottom: 20px;
+                    color: #FFD700;
+                }
+                .tier-features {
+                    list-style: none;
+                    padding: 0;
+                    margin: 20px 0;
+                }
+                .tier-features li {
+                    padding: 10px 0;
+                    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+                }
+                .tier-features li:before {
+                    content: "✓ ";
+                    color: #00FF88;
+                    font-weight: bold;
+                }
+                .payment-methods {
+                    text-align: center;
+                    margin-top: 60px;
+                    padding: 30px;
+                    background: rgba(255, 255, 255, 0.1);
+                    border-radius: 15px;
+                }
+                .cta-button {
+                    display: inline-block;
+                    background: linear-gradient(135deg, #00FF88 0%, #00D4FF 100%);
+                    color: #1a1a2e;
+                    padding: 15px 40px;
+                    border-radius: 30px;
+                    text-decoration: none;
+                    font-weight: bold;
+                    font-size: 1.1em;
+                    margin-top: 20px;
+                    transition: transform 0.3s;
+                }
+                .cta-button:hover {
+                    transform: scale(1.05);
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🎮 Roblox Presence Tracker</h1>
+                <p class="subtitle">Track any Roblox player in real-time on Discord</p>
+                
+                <div class="pricing-grid">
+                    <div class="tier-card">
+                        <div class="tier-icon">🆓</div>
+                        <div class="tier-name">Free</div>
+                        <div class="tier-price">$0</div>
+                        <ul class="tier-features">
+                            <li>1 player max</li>
+                            <li>30-second updates</li>
+                            <li>Basic notifications</li>
+                            <li>Private channels</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="tier-card popular">
+                        <div class="tier-icon">⚡</div>
+                        <div class="tier-name">Starter Pack</div>
+                        <div class="tier-price">$3.99</div>
+                        <ul class="tier-features">
+                            <li>10 players max</li>
+                            <li>5-second ultra-fast updates</li>
+                            <li>All features</li>
+                            <li>Lifetime access</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="tier-card">
+                        <div class="tier-icon">🔥</div>
+                        <div class="tier-name">Premium</div>
+                        <div class="tier-price">$19.99</div>
+                        <ul class="tier-features">
+                            <li>Unlimited players</li>
+                            <li>5-second ultra-fast updates</li>
+                            <li>Priority support</li>
+                            <li>Lifetime access</li>
+                        </ul>
+                    </div>
+                </div>
+                
+                <div class="payment-methods">
+                    <h2>💳 Payment Methods</h2>
+                    <p><strong>PayPal/USD:</strong> Send payment and contact admin with your Discord username</p>
+                    <p><strong>Robux:</strong> Buy our Roblox gamepass and verify with <code>/verify</code> command</p>
+                    <a href="#" class="cta-button">Get Started on Discord</a>
+                </div>
+            </div>
+        </body>
+        </html>
+        '''
+    
+    @app.route('/privacy-policy')
+    def privacy_policy():
+        return '''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Privacy Policy - Roblox Presence Tracker</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                body {
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    margin: 0;
+                    padding: 20px;
+                    line-height: 1.6;
+                }
+                .container {
+                    max-width: 900px;
+                    margin: 0 auto;
+                    background: rgba(255, 255, 255, 0.1);
+                    padding: 40px;
+                    border-radius: 20px;
+                    backdrop-filter: blur(10px);
+                }
+                h1 { font-size: 2.5em; margin-bottom: 10px; }
+                h2 { font-size: 1.8em; margin-top: 30px; border-bottom: 2px solid rgba(255,255,255,0.3); padding-bottom: 10px; }
+                p { margin: 15px 0; }
+                ul { margin: 10px 0; padding-left: 30px; }
+                .last-updated { opacity: 0.8; font-size: 0.9em; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🔒 Privacy Policy</h1>
+                <p class="last-updated">Last Updated: October 13, 2025</p>
+                
+                <h2>1. Information We Collect</h2>
+                <p>When you use our Discord bot and link your Roblox account via OAuth 2.0, we collect:</p>
+                <ul>
+                    <li><strong>Discord User ID:</strong> Your unique Discord identifier</li>
+                    <li><strong>Roblox Account Information:</strong> Username, user ID, and profile data (via openid and profile scopes)</li>
+                    <li><strong>OAuth Tokens:</strong> Encrypted access and refresh tokens for authentication</li>
+                    <li><strong>Tracking Preferences:</strong> Players you choose to track and subscription tier</li>
+                </ul>
+                
+                <h2>2. How We Use Your Information</h2>
+                <p>We use your information solely to:</p>
+                <ul>
+                    <li>Authenticate your Roblox account for personalized tracking</li>
+                    <li>Fetch player presence data based on your privacy permissions</li>
+                    <li>Send Discord notifications about tracked players</li>
+                    <li>Manage your subscription tier and tracking limits</li>
+                </ul>
+                
+                <h2>3. Data Storage & Security</h2>
+                <ul>
+                    <li>OAuth tokens are encrypted using industry-standard encryption (Fernet)</li>
+                    <li>Data is stored securely in a PostgreSQL database</li>
+                    <li>We never share your data with third parties</li>
+                    <li>You can delete your data anytime using <code>/unlink-roblox</code></li>
+                </ul>
+                
+                <h2>4. Third-Party Services</h2>
+                <p>We integrate with:</p>
+                <ul>
+                    <li><strong>Roblox API:</strong> To fetch player presence data (subject to Roblox Privacy Policy)</li>
+                    <li><strong>Discord API:</strong> To send notifications (subject to Discord Privacy Policy)</li>
+                </ul>
+                
+                <h2>5. Your Rights</h2>
+                <p>You have the right to:</p>
+                <ul>
+                    <li>Revoke OAuth access at any time (<code>/unlink-roblox</code>)</li>
+                    <li>Request data deletion (contact bot administrator)</li>
+                    <li>View your tracked players (<code>/mystatus</code>)</li>
+                </ul>
+                
+                <h2>6. Compliance</h2>
+                <p>This bot complies with:</p>
+                <ul>
+                    <li>Roblox Community Standards and Privacy Policy</li>
+                    <li>Discord Terms of Service and Privacy Policy</li>
+                    <li>OAuth 2.0 best practices and security standards</li>
+                </ul>
+                
+                <h2>7. Contact</h2>
+                <p>For privacy concerns or data requests, contact the bot administrator through Discord.</p>
+            </div>
+        </body>
+        </html>
+        '''
+    
+    @app.route('/terms-of-service')
+    def terms_of_service():
+        return '''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Terms of Service - Roblox Presence Tracker</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                body {
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    margin: 0;
+                    padding: 20px;
+                    line-height: 1.6;
+                }
+                .container {
+                    max-width: 900px;
+                    margin: 0 auto;
+                    background: rgba(255, 255, 255, 0.1);
+                    padding: 40px;
+                    border-radius: 20px;
+                    backdrop-filter: blur(10px);
+                }
+                h1 { font-size: 2.5em; margin-bottom: 10px; }
+                h2 { font-size: 1.8em; margin-top: 30px; border-bottom: 2px solid rgba(255,255,255,0.3); padding-bottom: 10px; }
+                p { margin: 15px 0; }
+                ul { margin: 10px 0; padding-left: 30px; }
+                .last-updated { opacity: 0.8; font-size: 0.9em; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>📜 Terms of Service</h1>
+                <p class="last-updated">Last Updated: October 13, 2025</p>
+                
+                <h2>1. Acceptance of Terms</h2>
+                <p>By using the Roblox Presence Tracker Discord bot, you agree to these Terms of Service. If you do not agree, please do not use the bot.</p>
+                
+                <h2>2. Service Description</h2>
+                <p>Our bot provides real-time Roblox player presence tracking through Discord, featuring:</p>
+                <ul>
+                    <li>Player online/offline status notifications</li>
+                    <li>Game activity tracking (subject to Roblox privacy settings)</li>
+                    <li>OAuth 2.0 authentication for personalized tracking</li>
+                    <li>Tiered subscription plans with different limits</li>
+                </ul>
+                
+                <h2>3. User Responsibilities</h2>
+                <p>You agree to:</p>
+                <ul>
+                    <li>Use the bot in compliance with Discord and Roblox Terms of Service</li>
+                    <li>Not abuse, exploit, or overload the bot's services</li>
+                    <li>Not track players for harassment or malicious purposes</li>
+                    <li>Respect tracked players' privacy settings</li>
+                    <li>Keep your account credentials secure</li>
+                </ul>
+                
+                <h2>4. Privacy & Data</h2>
+                <p>We collect and process data as described in our Privacy Policy. By using OAuth linking, you authorize us to access your Roblox account information within the requested scopes (openid, profile).</p>
+                
+                <h2>5. Subscription & Payments</h2>
+                <ul>
+                    <li>Paid tiers are lifetime purchases (one-time payment)</li>
+                    <li>No refunds for completed purchases</li>
+                    <li>We reserve the right to modify pricing for new purchases</li>
+                    <li>Admin may revoke access for Terms violations</li>
+                </ul>
+                
+                <h2>6. Service Limitations</h2>
+                <p>The bot cannot:</p>
+                <ul>
+                    <li>Bypass Roblox privacy settings (Status Off, Friends Only)</li>
+                    <li>Guarantee 100% uptime or real-time accuracy</li>
+                    <li>Track players who block the bot's Roblox account</li>
+                </ul>
+                
+                <h2>7. Prohibited Activities</h2>
+                <p>You may NOT:</p>
+                <ul>
+                    <li>Use the bot to harass, stalk, or harm others</li>
+                    <li>Reverse engineer, modify, or exploit the bot</li>
+                    <li>Resell or redistribute bot access</li>
+                    <li>Violate Roblox Community Standards or Discord ToS</li>
+                </ul>
+                
+                <h2>8. Disclaimer & Liability</h2>
+                <p>The bot is provided "as is" without warranties. We are not liable for:</p>
+                <ul>
+                    <li>Service interruptions or downtime</li>
+                    <li>Data loss or inaccuracies</li>
+                    <li>Actions taken by users of the bot</li>
+                    <li>Changes to Roblox/Discord APIs affecting functionality</li>
+                </ul>
+                
+                <h2>9. Termination</h2>
+                <p>We reserve the right to suspend or terminate access for users who violate these Terms, without refund.</p>
+                
+                <h2>10. Changes to Terms</h2>
+                <p>We may update these Terms at any time. Continued use after changes constitutes acceptance.</p>
+                
+                <h2>11. Compliance</h2>
+                <p>This service complies with:</p>
+                <ul>
+                    <li>Roblox Terms of Use and Community Standards</li>
+                    <li>Discord Terms of Service</li>
+                    <li>OAuth 2.0 security standards</li>
+                </ul>
+                
+                <h2>12. Contact</h2>
+                <p>For questions about these Terms, contact the bot administrator through Discord.</p>
+            </div>
+        </body>
+        </html>
+        '''
+    
+    app.run(host='0.0.0.0', port=5000)
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+    track_players.start()
+
+async def run_bot():
+    await bot.start(DISCORD_BOT_TOKEN)
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("Roblox Presence Tracker with Discord Bot")
+    print("=" * 50)
+    
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+    print("Flask server started on port 5000")
+    
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        print("\nShutting down...")
